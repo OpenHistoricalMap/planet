@@ -1,9 +1,28 @@
+// Prefix where UI pagination is enabled
+var PAGINATION_PATH_PREFIX = 'ohm-augmented-diffs/changesets/';
+
+// UI page size (what the user sees)
+var UI_PAGE_SIZE = 2000;
+
+// S3 hard limit per request is effectively 1000; keep it at 1000
+var S3_MAX_KEYS_PER_REQUEST = 1000;
+
+// State for UI pagination
+var currentUiPage = 0; // 0-based
+var acc = {
+  prefix: '',
+  directories: [],
+  files: [],        // accumulated files
+  nextMarker: null, // next S3 marker
+  fullyLoaded: false
+};
+
 if (typeof AUTO_TITLE != 'undefined' && AUTO_TITLE == true) {
   document.title = location.hostname;
 }
 
 if (typeof S3_REGION != 'undefined') {
-  var BUCKET_URL = location.protocol + '//' + location.hostname + '.' + S3_REGION + '.amazonaws.com'; // e.g. just 's3' for us-east-1 region
+  var BUCKET_URL = location.protocol + '//' + location.hostname + '.' + S3_REGION + '.amazonaws.com';
   var BUCKET_WEBSITE_URL = location.protocol + '//' + location.hostname;
 }
 
@@ -16,8 +35,6 @@ if (typeof BUCKET_URL == 'undefined') {
 }
 
 if (typeof BUCKET_NAME != 'undefined') {
-  // if bucket_url does not start with bucket_name,
-  // assume path-style url
   if (!~BUCKET_URL.indexOf(location.protocol + '//' + BUCKET_NAME)) {
     BUCKET_URL += '/' + BUCKET_NAME;
   }
@@ -41,134 +58,227 @@ if (typeof EXCLUDE_FILE == 'undefined') {
   var EXCLUDE_FILE = [EXCLUDE_FILE];
 }
 
-// https://tc39.github.io/ecma262/#sec-array.prototype.includes
+// Polyfill includes
 if (!Array.prototype.includes) {
   Object.defineProperty(Array.prototype, 'includes', {
     value: function(searchElement, fromIndex) {
-
-      if (this == null) {
-        throw new TypeError('"this" is null or not defined');
-      }
-
-      // 1. Let O be ? ToObject(this value).
-      var o = Object(this);
-
-      // 2. Let len be ? ToLength(? Get(O, "length")).
-      var len = o.length >>> 0;
-
-      // 3. If len is 0, return false.
-      if (len === 0) {
-        return false;
-      }
-
-      // 4. Let n be ? ToInteger(fromIndex).
-      //    (If fromIndex is undefined, this step produces the value 0.)
-      var n = fromIndex | 0;
-
-      // 5. If n ≥ 0, then
-      //  a. Let k be n.
-      // 6. Else n < 0,
-      //  a. Let k be len + n.
-      //  b. If k < 0, let k be 0.
-      var k = Math.max(n >= 0 ? n : len - Math.abs(n), 0);
-
-      function sameValueZero(x, y) {
-        return x === y || (typeof x === 'number' && typeof y === 'number' && isNaN(x) && isNaN(y));
-      }
-
-      // 7. Repeat, while k < len
-      while (k < len) {
-        // a. Let elementK be the result of ? Get(O, ! ToString(k)).
-        // b. If SameValueZero(searchElement, elementK) is true, return true.
-        if (sameValueZero(o[k], searchElement)) {
-          return true;
-        }
-        // c. Increase k by 1. 
-        k++;
-      }
-
-      // 8. Return false
+      if (this == null) { throw new TypeError('"this" is null or not defined'); }
+      var o = Object(this), len = o.length >>> 0;
+      if (len === 0) { return false; }
+      var n = fromIndex | 0, k = Math.max(n >= 0 ? n : len - Math.abs(n), 0);
+      function sameValueZero(x, y) { return x === y || (typeof x === 'number' && typeof y === 'number' && isNaN(x) && isNaN(y)); }
+      while (k < len) { if (sameValueZero(o[k], searchElement)) return true; k++; }
       return false;
     }
   });
 }
 
-jQuery(function($) { getS3Data(); });
+jQuery(function($) {
+  // Buttons (ensure you have #pagination-controls with #prev-button, #next-button, #page-indicator in tu HTML)
+  $('#prev-button').on('click', function() {
+    if ($(this).is(':disabled')) return;
+    currentUiPage = Math.max(0, currentUiPage - 1);
+    renderCurrentPage();
+    updatePaginationControls();
+  });
 
-// This will sort your file listing by most recently modified.
-// Flip the comparator to '>' if you want oldest files first.
-function sortFunction(a, b) {
-  switch (S3B_SORT) {
-    case "OLD2NEW":
-      return a.LastModified > b.LastModified ? 1 : -1;
-    case "NEW2OLD":
-      return a.LastModified < b.LastModified ? 1 : -1;
-    case "A2Z":
-      return a.Key < b.Key ? 1 : -1;
-    case "Z2A":
-      return a.Key > b.Key ? 1 : -1;
-    case "BIG2SMALL":
-      return a.Size < b.Size ? 1 : -1;
-    case "SMALL2BIG":
-      return a.Size > b.Size ? 1 : -1;
+  $('#next-button').on('click', function() {
+    if ($(this).is(':disabled')) return;
+    currentUiPage += 1;
+    ensureLoadedForPage(currentUiPage).then(function() {
+      renderCurrentPage();
+      updatePaginationControls();
+    }).fail(showError);
+  });
+
+  // Initial load
+  bootstrapLoad();
+});
+
+function bootstrapLoad() {
+  var prefix = detectPrefix();
+  var isPaginatedPrefix = (prefix === PAGINATION_PATH_PREFIX);
+
+  // Reset state each time prefix changes
+  acc = { prefix: prefix, directories: [], files: [], nextMarker: null, fullyLoaded: false };
+  currentUiPage = 0;
+
+  if (isPaginatedPrefix) {
+    $('#pagination-controls').show();
+    $('#listing').html('<img src="//assets.okfn.org/images/icons/ajaxload-circle.gif" />');
+    ensureLoadedForPage(0).then(function() {
+      renderCurrentPage();
+      updatePaginationControls();
+    }).fail(showError);
+  } else {
+    $('#pagination-controls').hide();
+    // Fallback: simple listing without UI pagination (fetch all S3 pages concatenated visually)
+    fetchAllPages(prefix).then(function(fullInfo) {
+      var info = applyExclusions(fullInfo);
+      if (S3B_SORT != 'DEFAULT') {
+        info.files.sort(sortFunction);
+      }
+      renderTable(info.directories.concat(info.files), info.prefix, 1);
+      buildNavigation({ prefix: info.prefix });
+    }).fail(showError);
   }
 }
 
-function getS3Data(marker, html) {
+function sortFunction(a, b) {
+  switch (S3B_SORT) {
+    case "OLD2NEW": return a.LastModified > b.LastModified ? 1 : -1;
+    case "NEW2OLD": return a.LastModified < b.LastModified ? 1 : -1;
+    case "A2Z": return a.Key < b.Key ? 1 : -1;
+    case "Z2A": return a.Key > b.Key ? 1 : -1;
+    case "BIG2SMALL": return a.Size < b.Size ? 1 : -1;
+    case "SMALL2BIG": return a.Size > b.Size ? 1 : -1;
+  }
+}
 
-  var s3_rest_url = createS3QueryUrl(marker);
-  // set loading notice
-  $('#listing')
-      .html('<img src="//assets.okfn.org/images/icons/ajaxload-circle.gif" />');
-  $.get(s3_rest_url)
-      .done(function(data) {
-        // clear loading notice
-        $('#listing').html('');
-        var xml = $(data);
-        var info = getInfoFromS3Data(xml);
+// Ensure we have loaded at least (pageIndex+1) * UI_PAGE_SIZE files; fetch more S3 pages as needed
+function ensureLoadedForPage(pageIndex) {
+  var needed = (pageIndex + 1) * UI_PAGE_SIZE;
+  var dfd = $.Deferred();
 
-        // Slight modification by FuzzBall03
-        // This will sort your file listing based on var S3B_SORT
-        // See url for example:
-        // http://esp-link.s3-website-us-east-1.amazonaws.com/
-        if (S3B_SORT != 'DEFAULT') {
-          var sortedFiles = info.files;
-          sortedFiles.sort(sortFunction);
-          info.files = sortedFiles;
-        }
+  // If already loaded enough or fully loaded, resolve
+  if (acc.files.length >= needed || acc.fullyLoaded) {
+    dfd.resolve(); return dfd.promise();
+  }
 
-        buildNavigation(info);
+  // Otherwise, fetch more S3 pages until we have enough or until S3 ends
+  function loop() {
+    if (acc.files.length >= needed || acc.fullyLoaded) { dfd.resolve(); return; }
+    fetchOneS3Page(acc.nextMarker).then(function(info) {
+      // Accumulate
+      if (!acc.directories.length) acc.directories = info.directories; // keep directories once
+      acc.files = acc.files.concat(info.files);
+      acc.nextMarker = (info.nextMarker && info.nextMarker !== 'null') ? decodeURIComponent(info.nextMarker) : null;
+      if (!acc.nextMarker) acc.fullyLoaded = true;
+      loop();
+    }).fail(function(e){ dfd.reject(e); });
+  }
 
-        // Add a <base> element to the document head to make relative links
-        // work even if the URI does not contain a trailing slash
-        var base = window.location.href
-        base = (base.endsWith('/')) ? base : base + '/';
-        $('head').append('<base href="' + base + '">');
+  loop();
+  return dfd.promise();
+}
 
-        html = typeof html !== 'undefined' ? html + prepareTable(info) :
-                                             prepareTable(info);
-        if (info.nextMarker != "null") {
-          getS3Data(info.nextMarker, html);
-        } else {
-          document.getElementById('listing').innerHTML =
-              '<pre>' + html + '</pre>';
-        }
-      })
-      .fail(function(error) {
-        console.error(error);
-        $('#listing').html('<strong>Error: ' + error + '</strong>');
-      });
+// Fetch a single S3 page (up to 1000 due to S3)
+function fetchOneS3Page(marker) {
+  var s3_rest_url = buildS3Url(acc.prefix, marker, S3_MAX_KEYS_PER_REQUEST);
+  $('#listing').html('<img src="//assets.okfn.org/images/icons/ajaxload-circle.gif" />');
+  return $.get(s3_rest_url).then(function(data) {
+    var xml = $(data);
+    var info = getInfoFromS3Data(xml);
+    // For the paginated prefix, always show newest first across the whole list
+    info = applyExclusions(info);
+    info.files.sort(function(a,b){ return a.LastModified < b.LastModified ? 1 : -1; });
+    buildNavigation({ prefix: info.prefix || acc.prefix });
+
+    // Ensure a <base> exists once
+    var base = window.location.href;
+    base = (base.endsWith('/')) ? base : base + '/';
+    if ($('head base').length === 0) {
+      $('head').append('<base href="' + base + '">');
+    }
+    return info;
+  });
+}
+
+// Render current UI page (slice of 2000) + parent row + numbering
+function renderCurrentPage() {
+  var start = currentUiPage * UI_PAGE_SIZE;
+  var end = Math.min(start + UI_PAGE_SIZE, acc.files.length);
+  var pageFiles = acc.files.slice(start, end);
+
+  var items = acc.directories.concat(pageFiles);
+  renderTable(items, acc.prefix, start + 1);
+  buildNavigation({ prefix: acc.prefix });
+}
+
+function updatePaginationControls() {
+  var hasPrev = currentUiPage > 0;
+  var hasMoreLoaded = acc.files.length > (currentUiPage + 1) * UI_PAGE_SIZE;
+  var canLoadMore = !acc.fullyLoaded || hasMoreLoaded;
+
+  $('#prev-button').prop('disabled', !hasPrev);
+
+  // If we already have enough loaded for the next page, enable Next.
+  // Otherwise, enable Next and it will load on demand when clicked.
+  var enableNext = canLoadMore;
+  $('#next-button').prop('disabled', !enableNext);
+
+  // Page indicator (1-based)
+  $('#page-indicator').text('Page ' + (currentUiPage + 1));
+}
+
+// Fallback: fetch all pages (used for non-paginated prefixes)
+function fetchAllPages(prefix) {
+  var accLocal = { files: [], directories: [], prefix: prefix, nextMarker: '' };
+  function loop() {
+    var url = buildS3Url(prefix, accLocal.nextMarker, S3_MAX_KEYS_PER_REQUEST);
+    return $.get(url).then(function(data) {
+      var xml = $(data);
+      var info = getInfoFromS3Data(xml);
+      info = applyExclusions(info);
+      accLocal.files = accLocal.files.concat(info.files);
+      accLocal.directories = accLocal.directories.concat(info.directories);
+      if (info.nextMarker && info.nextMarker !== 'null') {
+        accLocal.nextMarker = decodeURIComponent(info.nextMarker);
+        return loop();
+      } else {
+        return accLocal;
+      }
+    });
+  }
+  return loop();
+}
+
+function applyExclusions(info) {
+  var files = info.files, directories = info.directories;
+  if (typeof DO_NOT_DISPLAY !== 'undefined' && DO_NOT_DISPLAY) {
+    directories = directories.filter(function (dir) { return !DO_NOT_DISPLAY.directories.includes(dir.Key); });
+    files = files.filter(function (fil) { return !DO_NOT_DISPLAY.files.includes(fil.Key); });
+  }
+  files = files.filter(function(f) { return !EXCLUDE_FILE.includes(f.Key); });
+  return { files: files, directories: directories, prefix: info.prefix, nextMarker: info.nextMarker };
+}
+
+function buildS3Url(prefix, marker, maxKeys) {
+  var s3_rest_url = BUCKET_URL + '?delimiter=/&max-keys=' + (maxKeys || S3_MAX_KEYS_PER_REQUEST);
+  if (prefix) {
+    var prefix_param = prefix.replace(/\/$/, '') + '/';
+    s3_rest_url += '&prefix=' + prefix_param;
+  }
+  if (marker) {
+    s3_rest_url += '&marker=' + encodeURIComponent(marker);
+  }
+  return s3_rest_url;
+}
+
+function detectPrefix() {
+  var rx = '.*[?&]prefix=' + S3B_ROOT_DIR + '([^&]+)(&.*)?$';
+  var prefix = '';
+  if (S3BL_IGNORE_PATH == false) {
+    prefix = location.pathname.replace(/^\//, S3B_ROOT_DIR);
+  }
+  var match = location.search.match(rx);
+  if (match) {
+    prefix = S3B_ROOT_DIR + match[1];
+  } else if (S3BL_IGNORE_PATH) {
+    prefix = S3B_ROOT_DIR;
+  }
+  return prefix || '';
 }
 
 function buildNavigation(info) {
-  var root = '<a href="?prefix=">' + BUCKET_WEBSITE_URL + '</a> / ';
+  var root = '<a href="?prefix=">' + (BUCKET_WEBSITE_URL || BUCKET_URL) + '</a> / ';
   if (info.prefix) {
     var processedPathSegments = '';
     var content = $.map(info.prefix.split('/'), function(pathSegment) {
-      processedPathSegments =
-          processedPathSegments + encodeURIComponent(pathSegment) + '/';
-      return '<a href="?prefix=' + processedPathSegments + '">' + pathSegment +
-             '</a>';
+      if (pathSegment) {
+        processedPathSegments += encodeURIComponent(pathSegment) + '/';
+        return '<a href="?prefix=' + processedPathSegments + '">' + pathSegment + '</a>';
+      }
     });
     $('#navigation').html(root + content.join(' / '));
   } else {
@@ -176,179 +286,96 @@ function buildNavigation(info) {
   }
 }
 
-function createS3QueryUrl(marker) {
-  var s3_rest_url = BUCKET_URL;
-  s3_rest_url += '?delimiter=/';
-
-  //
-  // Handling paths and prefixes:
-  //
-  // 1. S3BL_IGNORE_PATH = false
-  // Uses the pathname
-  // {bucket}/{path} => prefix = {path}
-  //
-  // 2. S3BL_IGNORE_PATH = true
-  // Uses ?prefix={prefix}
-  //
-  // Why both? Because we want classic directory style listing in normal
-  // buckets but also allow deploying to non-buckets
-  //
-
-  var rx = '.*[?&]prefix=' + S3B_ROOT_DIR + '([^&]+)(&.*)?$';
-  var prefix = '';
-  if (S3BL_IGNORE_PATH == false) {
-    var prefix = location.pathname.replace(/^\//, S3B_ROOT_DIR);
-  }
-  var match = location.search.match(rx);
-  if (match) {
-    prefix = S3B_ROOT_DIR + match[1];
-  } else {
-    if (S3BL_IGNORE_PATH) {
-      var prefix = S3B_ROOT_DIR;
-    }
-  }
-  if (prefix) {
-    // make sure we end in /
-    var prefix = prefix.replace(/\/$/, '') + '/';
-    s3_rest_url += '&prefix=' + prefix;
-  }
-  if (marker) {
-    s3_rest_url += '&marker=' + marker;
-  }
-  return s3_rest_url;
-}
-
 function getInfoFromS3Data(xml) {
   var files = $.map(xml.find('Contents'), function(item) {
     item = $(item);
-    // clang-format off
     return {
       Key: item.find('Key').text(),
-          LastModified: item.find('LastModified').text(),
-          Size: bytesToHumanReadable(item.find('Size').text()),
-          Type: 'file'
-    }
-    // clang-format on
+      LastModified: item.find('LastModified').text(),
+      Size: bytesToHumanReadable(item.find('Size').text()),
+      Type: 'file'
+    };
   });
   var directories = $.map(xml.find('CommonPrefixes'), function(item) {
     item = $(item);
-    // clang-format off
-    return {
-      Key: item.find('Prefix').text(),
-        LastModified: '',
-        Size: '0',
-        Type: 'directory'
-    }
-    // clang-format on
+    return { Key: item.find('Prefix').text(), LastModified: '', Size: '0', Type: 'directory' };
   });
 
-  if ($(xml.find('IsTruncated')[0]).text() == 'true') {
-    var nextMarker = $(xml.find('NextMarker')[0]).text();
-  } else {
-    var nextMarker = null;
-  }
-  
-  // Filter files that is not necessary to display
-  if (DO_NOT_DISPLAY) {
-    directories = directories.filter(function (dir) {
-      return !DO_NOT_DISPLAY.directories.includes(dir.Key);
-    });
-    files = files.filter(function (fil) {
-      return !DO_NOT_DISPLAY.files.includes(fil.Key);
-    });
-  }
+  var nextMarker = $(xml.find('IsTruncated')[0]).text() == 'true'
+    ? $(xml.find('NextMarker')[0]).text()
+    : null;
 
-  // clang-format off
   return {
     files: files,
     directories: directories,
     prefix: $(xml.find('Prefix')[0]).text(),
-    nextMarker: encodeURIComponent(nextMarker)
-  }
-  // clang-format on
+    nextMarker: nextMarker ? encodeURIComponent(nextMarker) : 'null'
+  };
 }
 
-// info is object like:
-// {
-//    files: ..
-//    directories: ..
-//    prefix: ...
-// }
-function prepareTable(info) {
-  var files = info.directories.concat(info.files), prefix = info.prefix;
+// Rendering helpers (with numbering)
+function renderTable(items, prefix, startNumber) {
   var cols = [45, 30, 15];
-  var content = [];
-  content.push(padRight('Last Modified', cols[1]) + '  ' +
-               padRight('Size', cols[2]) + 'Key \n');
-  content.push(new Array(cols[0] + cols[1] + cols[2] + 4).join('-') + '\n');
+  var header = padRight('#', 8) + padRight('Last Modified', cols[1]) + '  ' + padRight('Size', cols[2]) + 'Key \n';
+  var content = header + new Array(header.length).join('-') + '\n';
 
-  // add ../ at the start of the dir listing, unless we are already at root dir
+  // Parent directory row (unnumbered)
   if (prefix && prefix !== S3B_ROOT_DIR) {
-    var up = prefix.replace(/\/$/, '').split('/').slice(0, -1).concat('').join(
-            '/'),  // one directory up
-        item =
-            {
-              Key: up,
-              LastModified: '',
-              Size: '',
-              keyText: '../',
-              href: S3BL_IGNORE_PATH ? '?prefix=' + up : '../'
-            },
-        row = renderRow(item, cols);
-    content.push(row + '\n');
+    var up = prefix.replace(/\/$/, '').split('/').slice(0, -1).concat('').join('/'),
+        upItem = { Key: up, LastModified: '', Size: '', keyText: '../', href: S3BL_IGNORE_PATH ? '?prefix=' + up : '../' };
+    content += renderRow(upItem, cols, null) + '\n';
   }
 
-  jQuery.each(files, function(idx, item) {
-    // strip off the prefix
-    item.keyText = item.Key.substring(prefix.length);
-    if (item.Type === 'directory') {
-      if (S3BL_IGNORE_PATH) {
-        item.href = location.protocol + '//' + location.hostname +
-                    location.pathname + '?prefix=' + encodePath(item.Key);
-      } else {
-        item.href = encodePath(item.keyText);
-      }
-    } else {
-      item.href = BUCKET_WEBSITE_URL + '/' + encodePath(item.Key);
+  items.forEach(function(item, idx) {
+    var keyText = item.Key.substring(prefix.length);
+    if (!keyText) return;
+
+    var href = item.Type === 'directory'
+      ? (S3BL_IGNORE_PATH
+          ? location.protocol + '//' + location.hostname + location.pathname + '?prefix=' + encodePath(item.Key)
+          : encodePath(keyText))
+      : (BUCKET_WEBSITE_URL || BUCKET_URL) + '/' + encodePath(item.Key);
+
+    var rowObj = { LastModified: item.LastModified, Size: item.Size, keyText: keyText, href: href };
+    var number = startNumber + idx;
+    if (!EXCLUDE_FILE.includes(item.Key)) {
+      content += renderRow(rowObj, cols, number) + '\n';
     }
-    var row = renderRow(item, cols);
-    if (!EXCLUDE_FILE.includes(item.Key))
-      content.push(row + '\n');
   });
 
-  return content.join('');
+  document.getElementById('listing').innerHTML = '<pre>' + content + '</pre>';
 }
 
-// Encode everything but "/" which are significant in paths and to S3
 function encodePath(path) {
-  return encodeURIComponent(path).replace(/%2F/g, '/')
+  return encodeURIComponent(path).replace(/%2F/g, '/');
 }
 
-function renderRow(item, cols) {
+function renderRow(item, cols, number) {
   var row = '';
-  row += padRight(item.LastModified, cols[1]) + '  ';
-  row += padRight(item.Size, cols[2]);
+  var numberStr = (number === null || typeof number === 'undefined') ? '' : number.toString();
+  row += padRight(numberStr, 8);
+  row += padRight(item.LastModified || '', cols[1]) + '  ';
+  row += padRight(item.Size || '', cols[2]);
   row += '<a href="' + item.href + '">' + item.keyText + '</a>';
   return row;
 }
 
 function padRight(padString, length) {
-  var str = padString.slice(0, length - 3);
-  if (padString.length > str.length) {
-    str += '...';
-  }
-  while (str.length < length) {
-    str = str + ' ';
-  }
-  return str;
+  var s = (padString || '').toString().slice(0, length - 3);
+  if ((padString || '').toString().length > s.length) { s += '...'; }
+  while (s.length < length) { s = s + ' '; }
+  return s;
 }
 
 function bytesToHumanReadable(sizeInBytes) {
+  if (sizeInBytes == 0) return '0';
   var i = -1;
-  var units = [' kB', ' MB', ' GB'];
-  do {
-    sizeInBytes = sizeInBytes / 1024;
-    i++;
-  } while (sizeInBytes > 1024);
+  var units = [' kB', ' MB', ' GB', ' TB'];
+  do { sizeInBytes = sizeInBytes / 1024; i++; } while (sizeInBytes > 1024);
   return Math.max(sizeInBytes, 0.1).toFixed(1) + units[i];
+}
+
+function showError(error) {
+  console.error(error);
+  $('#listing').html('<strong>Error: ' + error + '</strong>');
 }
