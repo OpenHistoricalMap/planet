@@ -61,7 +61,7 @@ if (typeof EXCLUDE_FILE == 'undefined') {
 // Polyfill includes
 if (!Array.prototype.includes) {
   Object.defineProperty(Array.prototype, 'includes', {
-    value: function(searchElement, fromIndex) {
+    value: function (searchElement, fromIndex) {
       if (this == null) { throw new TypeError('"this" is null or not defined'); }
       var o = Object(this), len = o.length >>> 0;
       if (len === 0) { return false; }
@@ -73,19 +73,19 @@ if (!Array.prototype.includes) {
   });
 }
 
-jQuery(function($) {
+jQuery(function ($) {
   // Buttons (ensure you have #pagination-controls with #prev-button, #next-button, #page-indicator in tu HTML)
-  $('#prev-button').on('click', function() {
+  $('#prev-button').on('click', function () {
     if ($(this).is(':disabled')) return;
     currentUiPage = Math.max(0, currentUiPage - 1);
     renderCurrentPage();
     updatePaginationControls();
   });
 
-  $('#next-button').on('click', function() {
+  $('#next-button').on('click', function () {
     if ($(this).is(':disabled')) return;
     currentUiPage += 1;
-    ensureLoadedForPage(currentUiPage).then(function() {
+    ensureLoadedForPage(currentUiPage).then(function () {
       renderCurrentPage();
       updatePaginationControls();
     }).fail(showError);
@@ -106,14 +106,27 @@ function bootstrapLoad() {
   if (isPaginatedPrefix) {
     $('#pagination-controls').show();
     $('#listing').html('<img src="//assets.okfn.org/images/icons/ajaxload-circle.gif" />');
-    ensureLoadedForPage(0).then(function() {
+    // Fetch all pages to sort by date descending (newest first)
+    fetchAllPages(prefix).then(function (fullInfo) {
+      var info = applyExclusions(fullInfo);
+      acc.directories = info.directories;
+      acc.files = info.files;
+      acc.fullyLoaded = true;
+      // Sort: Newest first (by File Number)
+      acc.files.sort(function (a, b) {
+        var aIdMatch = a.Key.match(/(\d+)/);
+        var bIdMatch = b.Key.match(/(\d+)/);
+        var aId = aIdMatch ? parseInt(aIdMatch[1]) : 0;
+        var bId = bIdMatch ? parseInt(bIdMatch[1]) : 0;
+        return aId < bId ? 1 : -1;
+      });
       renderCurrentPage();
       updatePaginationControls();
     }).fail(showError);
   } else {
     $('#pagination-controls').hide();
     // Fallback: simple listing without UI pagination (fetch all S3 pages concatenated visually)
-    fetchAllPages(prefix).then(function(fullInfo) {
+    fetchAllPages(prefix).then(function (fullInfo) {
       var info = applyExclusions(fullInfo);
       if (S3B_SORT != 'DEFAULT') {
         info.files.sort(sortFunction);
@@ -148,14 +161,14 @@ function ensureLoadedForPage(pageIndex) {
   // Otherwise, fetch more S3 pages until we have enough or until S3 ends
   function loop() {
     if (acc.files.length >= needed || acc.fullyLoaded) { dfd.resolve(); return; }
-    fetchOneS3Page(acc.nextMarker).then(function(info) {
+    fetchOneS3Page(acc.nextMarker).then(function (info) {
       // Accumulate
       if (!acc.directories.length) acc.directories = info.directories; // keep directories once
       acc.files = acc.files.concat(info.files);
       acc.nextMarker = (info.nextMarker && info.nextMarker !== 'null') ? decodeURIComponent(info.nextMarker) : null;
       if (!acc.nextMarker) acc.fullyLoaded = true;
       loop();
-    }).fail(function(e){ dfd.reject(e); });
+    }).fail(function (e) { dfd.reject(e); });
   }
 
   loop();
@@ -166,12 +179,12 @@ function ensureLoadedForPage(pageIndex) {
 function fetchOneS3Page(marker) {
   var s3_rest_url = buildS3Url(acc.prefix, marker, S3_MAX_KEYS_PER_REQUEST);
   $('#listing').html('<img src="//assets.okfn.org/images/icons/ajaxload-circle.gif" />');
-  return $.get(s3_rest_url).then(function(data) {
+  return $.get(s3_rest_url).then(function (data) {
     var xml = $(data);
     var info = getInfoFromS3Data(xml);
     // For the paginated prefix, always show newest first across the whole list
     info = applyExclusions(info);
-    info.files.sort(function(a,b){ return a.LastModified < b.LastModified ? 1 : -1; });
+    info.files.sort(function (a, b) { return a.LastModified < b.LastModified ? 1 : -1; });
     buildNavigation({ prefix: info.prefix || acc.prefix });
 
     // Ensure a <base> exists once
@@ -208,7 +221,8 @@ function updatePaginationControls() {
   $('#next-button').prop('disabled', !enableNext);
 
   // Page indicator (1-based)
-  $('#page-indicator').text('Page ' + (currentUiPage + 1));
+  var totalPages = Math.ceil(acc.files.length / UI_PAGE_SIZE);
+  $('#page-number').text('Page ' + (currentUiPage + 1) + ' of ' + totalPages);
 }
 
 // Fallback: fetch all pages (used for non-paginated prefixes)
@@ -216,7 +230,7 @@ function fetchAllPages(prefix) {
   var accLocal = { files: [], directories: [], prefix: prefix, nextMarker: '' };
   function loop() {
     var url = buildS3Url(prefix, accLocal.nextMarker, S3_MAX_KEYS_PER_REQUEST);
-    return $.get(url).then(function(data) {
+    return $.get(url).then(function (data) {
       var xml = $(data);
       var info = getInfoFromS3Data(xml);
       info = applyExclusions(info);
@@ -239,7 +253,7 @@ function applyExclusions(info) {
     directories = directories.filter(function (dir) { return !DO_NOT_DISPLAY.directories.includes(dir.Key); });
     files = files.filter(function (fil) { return !DO_NOT_DISPLAY.files.includes(fil.Key); });
   }
-  files = files.filter(function(f) { return !EXCLUDE_FILE.includes(f.Key); });
+  files = files.filter(function (f) { return !EXCLUDE_FILE.includes(f.Key); });
   return { files: files, directories: directories, prefix: info.prefix, nextMarker: info.nextMarker };
 }
 
@@ -274,7 +288,7 @@ function buildNavigation(info) {
   var root = '<a href="?prefix=">' + (BUCKET_WEBSITE_URL || BUCKET_URL) + '</a> / ';
   if (info.prefix) {
     var processedPathSegments = '';
-    var content = $.map(info.prefix.split('/'), function(pathSegment) {
+    var content = $.map(info.prefix.split('/'), function (pathSegment) {
       if (pathSegment) {
         processedPathSegments += encodeURIComponent(pathSegment) + '/';
         return '<a href="?prefix=' + processedPathSegments + '">' + pathSegment + '</a>';
@@ -287,7 +301,7 @@ function buildNavigation(info) {
 }
 
 function getInfoFromS3Data(xml) {
-  var files = $.map(xml.find('Contents'), function(item) {
+  var files = $.map(xml.find('Contents'), function (item) {
     item = $(item);
     return {
       Key: item.find('Key').text(),
@@ -296,7 +310,7 @@ function getInfoFromS3Data(xml) {
       Type: 'file'
     };
   });
-  var directories = $.map(xml.find('CommonPrefixes'), function(item) {
+  var directories = $.map(xml.find('CommonPrefixes'), function (item) {
     item = $(item);
     return { Key: item.find('Prefix').text(), LastModified: '', Size: '0', Type: 'directory' };
   });
@@ -322,18 +336,18 @@ function renderTable(items, prefix, startNumber) {
   // Parent directory row (unnumbered)
   if (prefix && prefix !== S3B_ROOT_DIR) {
     var up = prefix.replace(/\/$/, '').split('/').slice(0, -1).concat('').join('/'),
-        upItem = { Key: up, LastModified: '', Size: '', keyText: '../', href: S3BL_IGNORE_PATH ? '?prefix=' + up : '../' };
+      upItem = { Key: up, LastModified: '', Size: '', keyText: '../', href: S3BL_IGNORE_PATH ? '?prefix=' + up : '../' };
     content += renderRow(upItem, cols, null) + '\n';
   }
 
-  items.forEach(function(item, idx) {
+  items.forEach(function (item, idx) {
     var keyText = item.Key.substring(prefix.length);
     if (!keyText) return;
 
     var href = item.Type === 'directory'
       ? (S3BL_IGNORE_PATH
-          ? location.protocol + '//' + location.hostname + location.pathname + '?prefix=' + encodePath(item.Key)
-          : encodePath(keyText))
+        ? location.protocol + '//' + location.hostname + location.pathname + '?prefix=' + encodePath(item.Key)
+        : encodePath(keyText))
       : (BUCKET_WEBSITE_URL || BUCKET_URL) + '/' + encodePath(item.Key);
 
     var rowObj = { LastModified: item.LastModified, Size: item.Size, keyText: keyText, href: href };
