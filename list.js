@@ -1,6 +1,10 @@
 // Prefix where UI pagination is enabled
 var PAGINATION_PATH_PREFIX = 'ohm-augmented-diffs/changesets/';
 
+// Storage classes kept out of the listing. GLACIER_IR still downloads normally;
+// drop it from this list to show the weekly dumps again.
+var HIDDEN_STORAGE_CLASSES = ['DEEP_ARCHIVE', 'GLACIER_IR'];
+
 // UI page size (what the user sees)
 var UI_PAGE_SIZE = 2000;
 
@@ -254,6 +258,9 @@ function applyExclusions(info) {
     files = files.filter(function (fil) { return !DO_NOT_DISPLAY.files.includes(fil.Key); });
   }
   files = files.filter(function (f) { return !EXCLUDE_FILE.includes(f.Key); });
+  // Dumps older than 30 days move to Glacier. A Deep Archive object cannot be
+  // downloaded at all until it is restored, so listing it only offers a broken link.
+  files = files.filter(function (f) { return !HIDDEN_STORAGE_CLASSES.includes(f.StorageClass); });
   return { files: files, directories: directories, prefix: info.prefix, nextMarker: info.nextMarker };
 }
 
@@ -307,6 +314,7 @@ function getInfoFromS3Data(xml) {
       Key: item.find('Key').text(),
       LastModified: item.find('LastModified').text(),
       Size: bytesToHumanReadable(item.find('Size').text()),
+      StorageClass: item.find('StorageClass').text(),
       Type: 'file'
     };
   });
